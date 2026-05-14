@@ -1,1 +1,32 @@
-*.png
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+
+# Jupyter
+*.nbconvert.ipynb
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# NO ignorar PNGs porque vamos a versionar las figuras del notebook 06
+# (se quita la regla *.png que tenía el archivo original)
+
+# Archivos temporales pesados
+*.tmp
+*.log
+
+# Datos crudos pesados (el xlsx ya está en raw_data/, no duplicar)
+data/raw/*.xlsx
+data/raw/*.zip
+!data/raw/.gitkeep
+raw_data/*.png
