@@ -12,11 +12,9 @@ Convenio de etiquetas: y_partial usa -1 para muestras sin etiquetar
 
 import numpy as np
 
-from scipy.stats import multivariate_normal
+from scipy.linalg import solve_triangular
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.mixture import GaussianMixture
-
-from active_semi_clustering.semi_supervised.pairwise_constraints.copkmeans import COPKMeans
 
 
 # ---------------------------------------------------------------------------
@@ -167,8 +165,10 @@ class SemiSupervisedGMM:
         Número de componentes Gaussianas. Debe ser igual al número de clases
         para que el mapeo one-hot en el paso E sea directo.
     covariance_type : str, default='full'
-        Solo 'full' está implementado en el EM manual. Para otros tipos,
-        usar SupervisedBaseline con sklearn.
+        Tipo de matriz de covarianza a usar en el EM manual:
+        ``full`` (una matriz completa por componente), ``tied`` (una matriz
+        completa compartida), ``diag`` (diagonal por componente) o
+        ``spherical`` (varianza escalar por componente).
     max_iter : int, default=100
         Iteraciones máximas de EM.
     tol : float, default=1e-4
@@ -187,6 +187,12 @@ class SemiSupervisedGMM:
         reg_covar: float = 1e-3,
         random_state: int = 42,
     ):
+        allowed_covariances = {"full", "tied", "diag", "spherical"}
+        if covariance_type not in allowed_covariances:
+            raise ValueError(
+                f"covariance_type debe estar en {sorted(allowed_covariances)}, "
+                f"recibido: {covariance_type!r}"
+            )
         self.n_components = n_components
         self.covariance_type = covariance_type
         self.max_iter = max_iter
@@ -198,6 +204,41 @@ class SemiSupervisedGMM:
     # EM helpers
     # ------------------------------------------------------------------
 
+    def _log_gaussian_prob(
+        self,
+        X: np.ndarray,
+        means: np.ndarray,
+        covs: np.ndarray,
+    ) -> np.ndarray:
+        """Log densidad gaussiana vectorizada por componente."""
+        n, d = X.shape
+        log_prob = np.empty((n, self.n_components))
+        log_2pi = d * np.log(2.0 * np.pi)
+
+        for k in range(self.n_components):
+            diff = X - means[k]
+            try:
+                if self.covariance_type in {"diag", "spherical"}:
+                    var = np.maximum(np.diag(covs[k]), 1e-300)
+                    log_det = np.log(var).sum()
+                    mahalanobis = (diff * diff / var).sum(axis=1)
+                else:
+                    chol = np.linalg.cholesky(covs[k])
+                    solved = solve_triangular(
+                        chol,
+                        diff.T,
+                        lower=True,
+                        check_finite=False,
+                    )
+                    log_det = 2.0 * np.log(np.diag(chol)).sum()
+                    mahalanobis = (solved * solved).sum(axis=0)
+
+                log_prob[:, k] = -0.5 * (log_2pi + log_det + mahalanobis)
+            except np.linalg.LinAlgError:
+                log_prob[:, k] = -np.inf
+
+        return log_prob
+
     def _e_step(
         self,
         X: np.ndarray,
@@ -206,15 +247,9 @@ class SemiSupervisedGMM:
         weights: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Calcula log-responsabilidades normalizadas y log-normalización."""
-        n = X.shape[0]
-        log_resp = np.empty((n, self.n_components))
-        for k in range(self.n_components):
-            try:
-                log_resp[:, k] = np.log(weights[k] + 1e-300) + multivariate_normal.logpdf(
-                    X, mean=means[k], cov=covs[k]
-                )
-            except np.linalg.LinAlgError:
-                log_resp[:, k] = -np.inf
+        log_resp = self._log_gaussian_prob(X, means, covs)
+        log_resp += np.log(weights + 1e-300)
+
         # logsumexp manual con errstate para silenciar underflow inofensivo
         with np.errstate(under="ignore"):
             shift = log_resp.max(axis=1, keepdims=True)
@@ -222,19 +257,48 @@ class SemiSupervisedGMM:
         log_resp -= log_norm
         return log_resp, log_norm
 
+    def _estimate_covariances(
+        self, X: np.ndarray, resp: np.ndarray, means: np.ndarray, nk: np.ndarray
+    ) -> np.ndarray:
+        """Estima covarianzas respetando ``covariance_type``."""
+        _, d = X.shape
+        covs = np.empty((self.n_components, d, d))
+
+        if self.covariance_type == "tied":
+            tied_cov = np.zeros((d, d))
+            for k in range(self.n_components):
+                diff = X - means[k]
+                tied_cov += (resp[:, k : k + 1] * diff).T @ diff
+            tied_cov /= nk.sum()
+            tied_cov += self.reg_covar * np.eye(d)
+            covs[:] = tied_cov
+            return covs
+
+        for k in range(self.n_components):
+            diff = X - means[k]
+            if self.covariance_type == "full":
+                cov = (resp[:, k : k + 1] * diff).T @ diff / nk[k]
+                cov += self.reg_covar * np.eye(d)
+            elif self.covariance_type == "diag":
+                var = (resp[:, k : k + 1] * diff**2).sum(axis=0) / nk[k]
+                cov = np.diag(var + self.reg_covar)
+            elif self.covariance_type == "spherical":
+                var = (resp[:, k] * (diff**2).sum(axis=1)).sum() / (nk[k] * d)
+                cov = (var + self.reg_covar) * np.eye(d)
+            else:  # Defensa adicional; __init__ ya valida.
+                raise ValueError(f"covariance_type no soportado: {self.covariance_type}")
+            covs[k] = cov
+        return covs
+
     def _m_step(
         self, X: np.ndarray, resp: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Actualiza (means, covarianzas, pesos) a partir de responsabilidades."""
-        n, d = X.shape
+        n = X.shape[0]
         nk = resp.sum(axis=0) + 1e-10
         weights = nk / n
         means = (resp.T @ X) / nk[:, np.newaxis]
-        covs = np.empty((self.n_components, d, d))
-        for k in range(self.n_components):
-            diff = X - means[k]
-            covs[k] = (resp[:, k : k + 1] * diff).T @ diff / nk[k]
-            covs[k] += self.reg_covar * np.eye(d)
+        covs = self._estimate_covariances(X, resp, means, nk)
         return means, covs, weights
 
     # ------------------------------------------------------------------
@@ -254,23 +318,32 @@ class SemiSupervisedGMM:
         labeled_mask = y_partial != -1
         X_lab = X[labeled_mask]
         y_lab = y_partial[labeled_mask].astype(int)
-        classes = np.unique(y_lab)
         n, d = X.shape
+        n_lab = labeled_mask.sum()
+        rng = np.random.default_rng(self.random_state)
 
         # — Inicialización con estadísticos de las clases etiquetadas —
-        means = np.array([X_lab[y_lab == c].mean(axis=0) for c in classes])
-        covs = np.empty((self.n_components, d, d))
-        for i, c in enumerate(classes):
-            X_c = X_lab[y_lab == c]
-            if len(X_c) > 1:
-                covs[i] = np.cov(X_c.T) + self.reg_covar * np.eye(d)
+        means = np.empty((self.n_components, d))
+        for k in range(self.n_components):
+            in_class = y_lab == k
+            if in_class.any():
+                means[k] = X_lab[in_class].mean(axis=0)
             else:
-                covs[i] = np.eye(d) * self.reg_covar
-        weights = np.array([np.sum(y_lab == c) for c in classes], dtype=float)
+                means[k] = X_lab[rng.integers(0, len(X_lab))]
+
+        init_resp = np.zeros((n_lab, self.n_components))
+        for i, c in enumerate(y_lab):
+            init_resp[i, c] = 1.0
+        init_nk = init_resp.sum(axis=0) + 1e-10
+        covs = self._estimate_covariances(X_lab, init_resp, means, init_nk)
+        for k in range(self.n_components):
+            if np.sum(y_lab == k) <= 1:
+                covs[k] = np.eye(d) * self.reg_covar
+        weights = np.bincount(y_lab, minlength=self.n_components).astype(float)
+        weights = np.where(weights == 0, 1e-10, weights)
         weights /= weights.sum()
 
         # — Máscara one-hot para el paso E sobre puntos etiquetados —
-        n_lab = labeled_mask.sum()
         labeled_resp_fixed = np.zeros((n_lab, self.n_components))
         for i, c in enumerate(y_lab):
             labeled_resp_fixed[i, c] = 1.0
@@ -321,12 +394,8 @@ class SemiSupervisedGMM:
 
     def _predict_raw(self, X: np.ndarray) -> np.ndarray:
         """Asigna cada punto a la componente más probable (índice de componente)."""
-        n = X.shape[0]
-        log_prob = np.empty((n, self.n_components))
-        for k in range(self.n_components):
-            log_prob[:, k] = np.log(self.weights_[k] + 1e-300) + multivariate_normal.logpdf(
-                X, mean=self.means_[k], cov=self.covariances_[k]
-            )
+        log_prob = self._log_gaussian_prob(X, self.means_, self.covariances_)
+        log_prob += np.log(self.weights_ + 1e-300)
         return log_prob.argmax(axis=1)
 
     def predict(self, X: np.ndarray) -> np.ndarray:
@@ -342,7 +411,9 @@ class SemiSupervisedGMM:
 class ConstrainedKMeans:
     """
     K-Means con restricciones must-link (ML) y cannot-link (CL) derivadas
-    de la fracción etiquetada. Usa COP-KMeans de active-semi-supervised-clustering.
+    de la fracción etiquetada. Implementa una variante practica de COP-KMeans:
+    en cada iteración asigna cada punto al centroide más cercano que no viole
+    sus restricciones indexadas.
 
     Generación de restricciones:
       - Must-link  : dos puntos etiquetados con la misma clase.
@@ -351,7 +422,7 @@ class ConstrainedKMeans:
         para no saturar el solver.
 
     La predicción sobre nuevos puntos asigna cada muestra al centroide más
-    cercano (COP-KMeans no expone ``predict``).
+    cercano.
 
     Parameters
     ----------
@@ -363,6 +434,9 @@ class ConstrainedKMeans:
         Número máximo de pares must-link a usar.
     max_cl : int, default=500
         Número máximo de pares cannot-link a usar.
+    max_constraints : int, optional
+        Alias usado para sensibilidad: si se especifica, fija simultáneamente
+        ``max_ml`` y ``max_cl`` al mismo valor.
     random_state : int, default=42
     """
 
@@ -372,10 +446,15 @@ class ConstrainedKMeans:
         max_iter: int = 300,
         max_ml: int = 500,
         max_cl: int = 500,
+        max_constraints=None,
         random_state: int = 42,
     ):
         self.n_clusters = n_clusters
         self.max_iter = max_iter
+        if max_constraints is not None:
+            max_ml = max_constraints
+            max_cl = max_constraints
+        self.max_constraints = max_constraints
         self.max_ml = max_ml
         self.max_cl = max_cl
         self.random_state = random_state
@@ -421,6 +500,58 @@ class ConstrainedKMeans:
         cl = _unique_pairs(~same, self.max_cl)
         return ml, cl
 
+    def _build_constraint_adjacency(self, n_samples: int) -> None:
+        """Indexa restricciones por punto para validar asignaciones rapido."""
+        self.ml_adj_ = [[] for _ in range(n_samples)]
+        self.cl_adj_ = [[] for _ in range(n_samples)]
+        for i, j in self.ml_:
+            self.ml_adj_[i].append(j)
+            self.ml_adj_[j].append(i)
+        for i, j in self.cl_:
+            self.cl_adj_[i].append(j)
+            self.cl_adj_[j].append(i)
+
+    def _initial_centers(self, X: np.ndarray, y_partial: np.ndarray) -> np.ndarray:
+        """Inicializa centroides con medias etiquetadas y fallback aleatorio."""
+        rng = np.random.default_rng(self.random_state)
+        n, d = X.shape
+        centers = np.empty((self.n_clusters, d))
+        for k in range(self.n_clusters):
+            in_class = y_partial == k
+            if in_class.any():
+                centers[k] = X[in_class].mean(axis=0)
+            else:
+                centers[k] = X[rng.integers(0, n)]
+        return centers
+
+    def _nearest_labels(self, X: np.ndarray, centers: np.ndarray) -> np.ndarray:
+        dists = np.linalg.norm(X[:, np.newaxis, :] - centers[np.newaxis, :, :], axis=2)
+        return dists.argmin(axis=1)
+
+    def _can_assign(self, index: int, cluster: int, labels: np.ndarray) -> bool:
+        """Revisa si asignar `index` a `cluster` viola restricciones conocidas."""
+        for other in self.ml_adj_[index]:
+            if labels[other] != cluster:
+                return False
+        for other in self.cl_adj_[index]:
+            if labels[other] == cluster:
+                return False
+        return True
+
+    def _update_centers(
+        self, X: np.ndarray, labels: np.ndarray, old_centers: np.ndarray
+    ) -> np.ndarray:
+        rng = np.random.default_rng(self.random_state)
+        centers = old_centers.copy()
+        n = X.shape[0]
+        for k in range(self.n_clusters):
+            in_cluster = labels == k
+            if in_cluster.any():
+                centers[k] = X[in_cluster].mean(axis=0)
+            else:
+                centers[k] = X[rng.integers(0, n)]
+        return centers
+
     def fit(self, X: np.ndarray, y_partial: np.ndarray) -> "ConstrainedKMeans":
         """
         Ajusta COP-KMeans con restricciones derivadas de la fracción etiquetada.
@@ -433,10 +564,34 @@ class ConstrainedKMeans:
         """
         labeled_mask = y_partial != -1
         self.ml_, self.cl_ = self._generate_constraints(y_partial, labeled_mask)
+        self._build_constraint_adjacency(len(X))
 
-        self.model_ = COPKMeans(n_clusters=self.n_clusters, max_iter=self.max_iter)
-        self.model_.fit(X, ml=self.ml_, cl=self.cl_)
-        self.labels_ = self.model_.labels_
+        rng = np.random.default_rng(self.random_state)
+        centers = self._initial_centers(X, y_partial)
+        labels = self._nearest_labels(X, centers)
+        order = np.arange(len(X))
+
+        for iteration in range(self.max_iter):
+            old_labels = labels.copy()
+            rng.shuffle(order)
+
+            dists = np.linalg.norm(
+                X[:, np.newaxis, :] - centers[np.newaxis, :, :],
+                axis=2,
+            )
+            for i in order:
+                for candidate in np.argsort(dists[i]):
+                    if self._can_assign(i, int(candidate), labels):
+                        labels[i] = int(candidate)
+                        break
+
+            centers = self._update_centers(X, labels, centers)
+            if np.array_equal(labels, old_labels):
+                break
+
+        self.cluster_centers_ = centers
+        self.labels_ = labels
+        self.n_iter_ = iteration + 1
 
         # — Mapear clusters a clases por votación mayoritaria en etiquetados —
         y_lab = y_partial[labeled_mask].astype(int)
@@ -456,7 +611,7 @@ class ConstrainedKMeans:
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Asigna cada muestra al centroide más cercano y mapea a clase."""
-        centers = self.model_.cluster_centers_
+        centers = self.cluster_centers_
         dists = np.linalg.norm(X[:, np.newaxis, :] - centers[np.newaxis, :, :], axis=2)
         clusters = dists.argmin(axis=1)
         return np.array([self.cluster_to_class_[c] for c in clusters])
