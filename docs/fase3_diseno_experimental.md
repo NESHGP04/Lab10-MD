@@ -100,10 +100,10 @@ Los siguientes archivos CSV se generan durante la experimentación:
 
 | Archivo | Generado por | Contenido |
 |---|---|---|
-| `results/metrics/metrics_smoke.csv` | Esteban (hoy) | Verificación rápida del harness: 2 modelos × 2 fracciones × 2 seeds = 8 filas |
-| `results/metrics/metrics_full.csv` | Ian (jueves) | Experimento principal: 3 modelos × 3 fracciones × 5 seeds = 45 filas |
-| `results/metrics/sensitivity_gmm.csv` | Ian (jueves) | Grid search GMM: 24 combinaciones × 3 seeds = 72 filas |
-| `results/metrics/sensitivity_ckm.csv` | Ian (jueves) | Grid search CKM: 8 combinaciones × 3 seeds = 24 filas |
+| `results/metrics/metrics_smoke.csv` | Equipo | Verificación rápida del harness: 2 modelos × 2 fracciones × 2 seeds = 8 filas |
+| `results/metrics/metrics_full.csv` | Equipo | Experimento principal: 3 modelos × 3 fracciones × 5 seeds = 45 filas |
+| `results/metrics/sensitivity_gmm.csv` | Equipo | Grid search GMM: 24 combinaciones × 3 seeds = 72 filas |
+| `results/metrics/sensitivity_ckm.csv` | Equipo | Grid search CKM: 8 combinaciones × 3 seeds = 24 filas |
 
 Todos los CSV incluyen las columnas `model`, `label_fraction`, `seed`, `accuracy`, `f1_macro`, `recall_macro`, `train_time_s`, `error`. Los archivos de grid search incluyen adicionalmente columnas por cada hiperparámetro de la grilla correspondiente.
 
